@@ -32,7 +32,7 @@ typedef uint16_t gf;
 //******************** prototypes
 // Function prototypes
 void support_gen(gf *s, const unsigned char *c);
-void synd(gf *out, gf *f, gf *L, unsigned char *r);
+
 void root(gf *out, gf *f, gf *L);
 void transpose_64x64(uint64_t *out, uint64_t *in);
 gf eval(gf *f, gf a);
@@ -274,93 +274,7 @@ void bm(gf *out, gf *s)
 		out[i] = C[ SYS_T-i ];
 }
 //******************** endof bm.c method
-//******************** decrypt.c method
-int decrypt(int *e, const unsigned char *sk, const unsigned char *c){	
-	int i, w = 0; 
-	// q: print c[] array using for loop
-	
-	
 
-	
-	unsigned char r[ SYS_N/8 ]; 
-	gf g[ SYS_T+1 ]; // goppa polynomial
-	gf L[ SYS_N ]; // support
-	gf s[ SYS_T*2 ]; // random string s
-	gf locator[ SYS_T+1 ]; // error locator 
-	gf images[ SYS_N ]; // 
-	gf t;
-
-	
-	for (i = 0; i < SYND_BYTES; i++)       r[i] = c[i]; // appending c0 to r
-	
-	
-	
-	for (i = SYND_BYTES; i < SYS_N/8; i++) r[i] = 0; // appending 2720 zeroes
-	
-
-	for (i = 0; i < SYS_T; i++) { g[i] = load_gf(sk); sk += 2; } g[ SYS_T ] = 1; // load goppa polynomial from sk to g[] // 'load_gf' is utility function from util.c
-	
-	
-	
-	
-	
-
-	
-	support_gen(L, sk); // (α0, α1, α2, . . .αn) from secret key having  condition bits // support_gen function is in benes.c
-	
-	
-	synd(s, g, L, r); // string s having the syndrome of length 2t , g, L, r vector 
-	// q: print s[] array using for loop 	
-	
-	
-	
-
-	
-
-	
-	bm(locator, s); // string s length 2t
-	// printf("\n ");
-	// for (int i = 0; i < SYS_T + 1; i++) {
-	// printf("%d ", locator[i]);
-	// }
-	// printf("\n ");
-	
-
-
-	
-	root(images, locator, L); // 
-	for (i = 0; i < SYS_N; i++) {
-		printf("%u ", images[i]);
-	}
-	printf("\n");
-
-	
-
-
-	
-	for (i = 0; i < SYS_N/8; i++) 
-		e[i] = 0;
-
-	for (i = 0; i < SYS_N; i++)
-	{
-		t = gf_iszero(images[i]) & 1;
-
-		e[ i/8 ] |= t << (i%8);
-		w += t;
-
-	}
-
-	
-    // int k;
-    // printf("decrypt e: positions : ");
-    // for (k = 0;k < SYS_N;++k)
-    //   if (e[k/8] & (1 << (k&7)))
-    //     printf(" %d",k);
-    // printf("\n\n");
-
-return 1;
-}
-//******************** endof decrypt.c method
 //******************** benes.c methods
 /* one layer of the benes network */
 static void layer(uint64_t * data, uint64_t * bits, int lgs)
@@ -567,96 +481,7 @@ void transpose_64x64(uint64_t * out, uint64_t * in)
 //******************** synd.c method
 /* input: Goppa polynomial f, support L, received word r */
 /* output: out, the syndrome of length 2t */
-void synd(gf *out, gf *f, gf *L, unsigned char *r)
-{
-	int i, j;
-	gf e, e_inv[SYS_N], c[SYS_N];
 
-	for (j = 0; j < 2*SYS_T; j++)
-		out[j] = 0;
-	// printf("c: ");
-	for(int i = 0; i < SYS_N; i++) {
-		c[i] = (r[i/8] >> (i%8)) & 1;
-		//  printf("%u ", c[i]);
-		// printf("%d ", c[i]);
-		e = eval(f, L[i]);
-		e_inv[i] = gf_inv(gf_mul(e,e));
-	}
-	// printf("\n");
-
-
-	// for (i = 768; i < SYS_N; i++)
-	// {
-	// 	for (j = 0; j < 2*SYS_T; j++)
-	// 	{
-	// 		out[j] = gf_add(out[j], gf_mul(e_inv[i], 0));
-	// 		e_inv[i] = gf_mul(e_inv[i], L[i]);
-	// 	}
-	// }
-	// for(int i = 0; i < 2*SYS_T; i++) {
-	// 	printf("%d ", out[i]);
-	// }
-	// printf("\n");
-	gf e_inv_LOOP[SYS_N][2*SYS_T];
-	for(int i = 0; i < SYS_N; i++) {
-		// e_inv_LOOP[i][0] = gf_mul(e_inv[i], L[i]);
-		e_inv_LOOP[i][0] = e_inv[i];
-		// printf("e_inv_LOOP[%d][0] = %d\t",i,e_inv_LOOP[i][0]);
-		for(int j = 1; j < 2*SYS_T; j++) {
-			e_inv_LOOP[i][j] = gf_mul(e_inv_LOOP[i][j-1], L[i]);
-			// printf("e_inv_LOOP[%d][%d] = %d\t",i,j,e_inv_LOOP[i][j]);
-		}
-		// printf("\n");
-	}
-	// q: print e_inv_LOOP array using for loop
-	// for(int i = 0; i < SYND_BYTES*8; i++) {
-	// 	for(int j = 0; j < 2*SYS_T; j++) {
-	// 		printf("%d ", e_inv_LOOP[i][j]);
-	// 	}
-	// 	printf("\n");
-	// }
-	// printf("\n");
-
-	// printf("***\n");
-	for (i = 0; i < SYS_N; i++)
-	{
-		for (j = 0; j < 2*SYS_T; j++)
-		{
-			out[j] = gf_add(out[j], gf_mul(e_inv_LOOP[i][j], c[i]));
-			
-		}
-	}
-	// printf("\n**************************************\n");
-	//   for (int i = 0; i < 2 * SYS_T; i++) {
-    //     printf("%u ", out[i]);
-    // }
-    
-	// printf("\n**************************************\n");
-	
-}
-
-// void synd(gf *out, gf *f, gf *L, unsigned char *r)
-// {
-// 	int i, j;
-// 	gf e, e_inv, c;
-
-// 	for (j = 0; j < 2*SYS_T; j++)
-// 		out[j] = 0;
-
-// 	for (i = 0; i < SYS_N; i++)
-// 	{
-// 		c = (r[i/8] >> (i%8)) & 1;
-
-// 		e = eval(f, L[i]);
-// 		e_inv = gf_inv(gf_mul(e,e));
-
-// 		for (j = 0; j < 2*SYS_T; j++)
-// 		{
-// 			out[j] = gf_add(out[j], gf_mul(e_inv, c));
-// 			e_inv = gf_mul(e_inv, L[i]);
-// 		}
-// 	}
-// }
 //******************** endof synd.c method
 //******************** root.c methods
 /* input: polynomial f and field element a */
@@ -687,47 +512,45 @@ void root(gf *out, gf *f, gf *L)
 		out[i] = eval(f, L[i]);
 }
 int tv; //test_vector
-char secretkeys[1][crypto_kem_SECRETKEYBYTES];
-char ciphertexts[KATNUM][crypto_kem_CIPHERTEXTBYTES];
-// int (*error_encrypt_positions)[SYS_T] = malloc(KATNUM * sizeof(*error_encrypt_positions)); // Adjusted for 1 billion entries
-// int error_encrypt_positions[KATNUM][SYS_T]; // Adjusted for 10 entries
+unsigned char secretkeys[1][crypto_kem_SECRETKEYBYTES];
+unsigned char ciphertexts[KATNUM][crypto_kem_CIPHERTEXTBYTES];
 int e[SYS_N / 8];
-int i;
+int i,w = 0,j,k;
+gf g[ SYS_T+1 ]; // goppa polynomial
+gf L[ SYS_N ]; // support
+gf e_inv_LOOP[SYS_N][2*SYS_T];
+gf  e_inv[SYS_N];
+unsigned char r[ SYS_N/8 ]; 
+gf out[ SYS_T*2 ]; // random string s
+gf locator[ SYS_T+1 ]; // error locator 
+gf images[ SYS_N ]; // 
+gf t,c[SYS_N],temp;
+clock_t start, end;
+double cpu_time_used;
+unsigned char *sk = NULL;
 //******************** endof root.c methods
 int main() {
     
-    unsigned char *sk1 = NULL;
-    unsigned char *ct1 = NULL;
-    unsigned char *sk2 = sk1;
-
     
+    
+       
 
     FILE *file1 = fopen("ct.bin", "rb");
     FILE *file2 = fopen("sk.bin", "rb");
-    FILE *file = fopen("error_positions.bin", "rb");   
-    
+   
 
-    if (file == NULL || file1 == NULL || file2 == NULL) {
+    if (file1 == NULL || file2 == NULL) {
         perror("Error opening file");
         return 1;
     }
 
-    // if (fread(error_encrypt_positions, sizeof(int), KATNUM * SYS_T, file) != KATNUM * SYS_T) {
-    //     fprintf(stderr, "Error reading error positions from binary file.\n");
-    //     fclose(file);
-    //     return 1;
-    // }
 
     if (fread(secretkeys, crypto_kem_SECRETKEYBYTES, 1, file2) != 1) {
         fprintf(stderr, "Error reading from file_sk");
         fclose(file2);
         return 1;
     }
-	// printf("secretkeys: ");
-	// for(int i = 0; i < crypto_kem_SECRETKEYBYTES; i++) {
-	// 	printf("%u ", secretkeys[0][i]);
-	// }
-	// printf("\n");
+
 
 
     if (fread(ciphertexts, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
@@ -735,36 +558,74 @@ int main() {
         fclose(file1);
         return 1;
     }
-	
+	fclose(file1);
+	fclose(file2);
     
-    clock_t start, end;
-    double cpu_time_used;
-
+    
+	sk = secretkeys[0] + 40;
     start = clock();
-    for(i = 0 ; i < 1;i++) {
-		// printf("time taken for first %d decryptions: ", (i+1)*1000);
-    for (tv = 0; tv < KATNUM; tv++) {
-        // printf("Test Vector %d, Error Positions:\n", tv);
-        // for (int k = 0; k < SYS_T; k++) {
-        //     printf("%d ", error_encrypt_positions[tv][k]);
-        // }
-        // printf("\n");
-
-        
-       
-        decrypt(e,(unsigned char *)secretkeys[0] + 40, (unsigned char *)ciphertexts[tv]);
-        // sk1 = sk2;
+	
+	for (i = 0; i < SYS_T; i++) { g[i] = load_gf(sk); sk += 2; } g[ SYS_T ] = 1; // load goppa polynomial from sk to g[] // 'load_gf' is utility function from util.c
+	
+	support_gen(L, sk); 
+	
+	for (i = 0; i < SYS_N; i++) {
+        temp = eval(g, L[i]);
+        e_inv[i] = gf_inv(gf_mul(temp, temp));
     }
-	end = clock(); // Record the end time
+    for (i = 0; i < SYS_N; i++) {
+        e_inv_LOOP[i][0] = e_inv[i];
+        for (j = 1; j < 2*SYS_T; j++) {
+            e_inv_LOOP[i][j] = gf_mul(e_inv_LOOP[i][j-1], L[i]);
+        }
+    }
+    
+		for (tv = 0; tv < KATNUM; tv++) {
+
+			memset(r + SYND_BYTES, 0, (SYS_N/8 - SYND_BYTES));
+			memset(c, 0, sizeof(c));
+			memset(out, 0, sizeof(out));			
+			memset(locator, 0, sizeof(locator));
+			memset(images, 0, sizeof(images));
+			memset(e, 0, SYS_N/8);
+
+			for (i = 0; i < SYND_BYTES; i++)       
+				r[i] = ciphertexts[tv][i];
+
+			for(i = 0; i < SYS_N; i++) 
+				c[i] = (r[i/8] >> (i%8)) & 1;		
+			
+			for (i = 0; i < SYS_N; i++)	
+				for (j = 0; j < 2*SYS_T; j++)
+					out[j] = gf_add(out[j], gf_mul(e_inv_LOOP[i][j], c[i]));
+			
+
+			bm(locator, out);
+
+			root(images, locator, L);
+			
+
+			for (i = 0; i < SYS_N; i++) {
+				t = gf_iszero(images[i]) & 1;
+				e[ i/8 ] |= t << (i%8);
+				w += t;
+			}
+
+			
+			printf("decrypt e: positions : ");
+			for (k = 0;k < SYS_N;++k)
+				if (e[k/8] & (1 << (k&7)))
+					printf(" %d",k);
+				printf("\n\n");
+			
+		}
+
+	end = clock(); 
 
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC; // Calculate the CPU time used
 
-    // printf("%f \n", cpu_time_used);
-    }
-  
-    fclose(file);
-    fclose(file1);
-    fclose(file2);
+    printf("%f \n", cpu_time_used);  
+
     return KAT_SUCCESS;
 }
 
