@@ -1,3 +1,20 @@
+/**
+ * @file Decrypt_Streams.cu
+ * @brief CUDA implementation of a decryption algorithm for streams.
+ *
+ * This file contains the CUDA kernels and device functions used for decrypting streams.
+ * It includes constant variables, device and CPU variables, and various device functions
+ * for performing operations on Galois field elements.
+ *
+ * The implementation includes functions for matrix-vector multiplication, polynomial evaluation,
+ * bit-reversal, and loading data from memory.
+ *
+ * The code is organized into CUDA kernels and device functions, with detailed comments
+ * explaining the purpose and functionality of each function.
+ *
+ * This implementation is part of a larger decryption system and is intended to be used
+ * in conjunction with other components.
+ */
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "common.h"
@@ -16,21 +33,44 @@ unsigned char (*d_ciphertexts)[crypto_kem_CIPHERTEXTBYTES];
 gf (*d_out)[2*SYS_T];
 gf (*d_locator)[SYS_T + 1];
 gf *d_images;
+int *d_e;
 //*****************************cpu variables********************************
 char secretkeys[1][crypto_kem_SECRETKEYBYTES];   
 unsigned char ciphertexts[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts1[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts2[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts3[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts4[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts5[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts6[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts7[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts8[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+unsigned char ciphertexts9[KATNUM][crypto_kem_CIPHERTEXTBYTES];
+// int batch = 2;
+// unsigned char ciphertexts[batch][KATNUM][crypto_kem_CIPHERTEXTBYTES];
 gf g[SYS_T + 1], L[SYS_N];
 gf e_inv_LOOP[SYS_N][2*SYS_T];
 gf  e_inv[SYS_N];
 int i,j,k,tv,w = 0;
-gf c[KATNUM][SYS_N];
-gf out[KATNUM][2*SYS_T];
-gf locator[KATNUM][SYS_T + 1];
+// gf c[KATNUM][SYS_N];
+// gf out[KATNUM][2*SYS_T];
+// gf locator[KATNUM][SYS_T + 1];
 gf images[KATNUM][SYS_N];
-int e[KATNUM][SYS_N / 8];
-gf t;
+int e[SYS_N / 8];
+gf temp,t;
+clock_t start, end;
+double cpu_time_used;
+double cpu_printing;
+unsigned char *sk = 0;
 //*******************************************************************************
-
+dim3 blocksPerGridc((KATNUM + 15) / 16, (SYS_N + 15) / 16); // total blocksper grid = 16 * 16 = 256
+	dim3 threadsPerBlockc(16, 16); // total 256 threads per block and total threads = 256 * 256
+	int numBlocksX = (KATNUM + threadsPerBlockc.x - 1) / threadsPerBlockc.x;
+	int numBlocksY = (2 * SYS_T + threadsPerBlockc.y - 1) / threadsPerBlockc.y;
+	dim3 blocksPerGridm(numBlocksX, numBlocksY);
+	int threadsPerBlockb = 256;
+	int blocksPerGridb = (KATNUM + threadsPerBlockb - 1) / threadsPerBlockb;
+	int blocksPerGridR = (SYS_N + threadsPerBlockb - 1) / threadsPerBlockb;
 //*********************** device functions **************************************
 __device__ gf d_gf_sq(gf in) 
 {
@@ -138,8 +178,8 @@ __device__ gf iszero(gf a)
 
 	return (gf) t;
 }
-__global__ void d_root(gf *d_out, gf (*d_f)[SYS_T + 1], gf *d_L, int katNum)
-{
+
+__global__ void d_root(gf *d_out, gf (*d_f)[SYS_T + 1], gf *d_L, int katNum) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < SYS_N) {
         for (int k = 0; k < katNum; k++) {
@@ -610,7 +650,7 @@ void precomputeLookupTables() {
 }
 //******************** endof bm.c method
 int keysetup() {
-    unsigned char *sk = 0;	
+    	
     
 
     FILE *file1 = fopen("ct.bin", "rb");
@@ -625,12 +665,67 @@ int keysetup() {
         fclose(file2);
         return 1;
     }	
-    if (fread(ciphertexts, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
-        fprintf(stderr, "Error reading from file_ct");
-        fclose(file1);
-        return 1;
-    }
+	if (fread(ciphertexts, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+		fprintf(stderr, "Error reading from file_ct");
+		fclose(file1);
+		return 1;
+	}
+
+	// fseek(file1, KATNUM * crypto_kem_CIPHERTEXTBYTES, SEEK_CUR);
+
+	if (fread(ciphertexts1, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+	fprintf(stderr, "Error reading from file_ct");
 	fclose(file1);
+	return 1;
+	}
+
+
+	if (fread(ciphertexts2, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+	fprintf(stderr, "Error reading from file_ct");
+	fclose(file1);
+	return 1;
+	}
+	
+	if (fread(ciphertexts3, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+		fprintf(stderr, "Error reading from file_ct");
+		fclose(file1);
+		return 1;
+		}
+	
+	if (fread(ciphertexts4, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}
+	
+		if (fread(ciphertexts5, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}
+		if (fread(ciphertexts6, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}
+		if (fread(ciphertexts7, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}
+		if (fread(ciphertexts8, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}
+		if (fread(ciphertexts9, crypto_kem_CIPHERTEXTBYTES, KATNUM, file1) != KATNUM) {
+			fprintf(stderr, "Error reading from file_ct");
+			fclose(file1);
+			return 1;
+		}	
+	fclose(file1);
+	// set ciphertext pointer next to the last ciphertext of some dummy variable
+	// ciphertexts += KATNUM * crypto_kem_CIPHERTEXTBYTES;
     sk = (unsigned char *)secretkeys + 40; // Adjusted to pointer arithmetic
     fclose(file2);
     
@@ -642,8 +737,8 @@ int keysetup() {
     support_gen(L, sk);	
 
     for (i = 0; i < SYS_N; i++) {
-        gf e = eval(g, L[i]);
-        e_inv[i] = gf_inv(gf_mul(e, e));
+        temp = eval(g, L[i]);
+        e_inv[i] = gf_inv(gf_mul(temp, temp));
     }
     for (i = 0; i < SYS_N; i++) {
         e_inv_LOOP[i][0] = e_inv[i];
@@ -660,73 +755,84 @@ int keysetup() {
 
     return 0; // Assuming successful execution
 }
-int main()
-{	
+void launch(unsigned char (*ciphertext)[96]) {
+	start = clock();
+	
 
-	keysetup();
-	clock_t start, end;
-    double cpu_time_used;
-    start = clock();
-//********************************************************
-	// Initialization
-	dim3 blocksPerGridc((KATNUM + 15) / 16, (SYS_N + 15) / 16);
-	dim3 threadsPerBlockc(16, 16);
-	int numBlocksX = (KATNUM + threadsPerBlockc.x - 1) / threadsPerBlockc.x;
-	int numBlocksY = (2 * SYS_T + threadsPerBlockc.y - 1) / threadsPerBlockc.y;
-	dim3 blocksPerGridm(numBlocksX, numBlocksY);
-	int threadsPerBlockb = 256;
-	int blocksPerGridb = (KATNUM + threadsPerBlockb - 1) / threadsPerBlockb;
-	int blocksPerGridR = (SYS_N + threadsPerBlockb - 1) / threadsPerBlockb;
-	cudaMalloc(&d_ciphertexts, sizeof(ciphertexts));
-	cudaMalloc(&d_c, sizeof(c)); // Device memory for c
-	cudaMalloc(&d_out, sizeof(gf) * KATNUM * 2 * SYS_T); // Device memory for out
-	cudaMemcpy(d_ciphertexts, ciphertexts, sizeof(ciphertexts), cudaMemcpyHostToDevice);
-	cudaMalloc(&d_locator, sizeof(gf) * KATNUM * 2 * SYS_T);
-	cudaMalloc(&d_images, sizeof(gf) * KATNUM * SYS_N);
-
+	cudaMemcpy(d_ciphertexts, ciphertext,  KATNUM * crypto_kem_CIPHERTEXTBYTES, cudaMemcpyHostToDevice);
 	//**************** kernels ***************************************************************
 	initRAndComputeC<<<blocksPerGridc, threadsPerBlockc>>>(d_ciphertexts, d_c);
 	matrixVectorMulKernel<<<blocksPerGridm, threadsPerBlockc>>>(d_c, d_out, d_e_inv_LOOP_device);
 	d_bm<<<blocksPerGridb, threadsPerBlockb>>>(d_locator,d_out);
 	d_root<<<blocksPerGridR, threadsPerBlockb>>>(d_images, d_locator, d_L, KATNUM);
-	cudaDeviceSynchronize();
+	
+	//**************** end of kernels ********************************************************
+	cudaDeviceSynchronize();	
 	cudaMemcpy(images, d_images, sizeof(gf) * KATNUM * SYS_N, cudaMemcpyDeviceToHost);
+	end = clock(); // Record the end time
+	cpu_time_used += ((double) (end - start)) / CLOCKS_PER_SEC; // Calculate the CPU time used
+	
 
-
-
-	for(j = 0; j < KATNUM; j++) {
-
-
+	start = clock();
+	for(j = 0; j < KATNUM; j++) {		
+		memset(e, 0, (SYS_N / 8));
+		w = 0;
 		for (i = 0; i < SYS_N; i++) {
-			
 			t = gf_iszero(images[j][i]) & 1;
-			e[j][ i/8 ] |= t << (i%8);
+			e[ i/8 ] |= t << (i%8);
 			w += t;
 		}
 
+		
 		printf("decrypt e: positions : ");
-    	for (k = 0;k < SYS_N;++k)
-      		if (e[j][k/8] & (1 << (k&7)))
-        		printf(" %d",k);
-    	printf("\n\n");
+		for (k = 0; k < SYS_N; ++k) {
+			if (e[k / 8] & (1 << (k & 7))) {
+				printf(" %d", k);
+			}
+		}
+		printf("\n\n");
+		
 	}
-
-
-
-
-
-
-
-//**********************************************************
 	end = clock(); // Record the end time
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC; // Calculate the CPU time used
-	
+	cpu_printing += ((double) (end - start)) / CLOCKS_PER_SEC; // Calculate the CPU time used
 
-    printf("%f \n", cpu_time_used);
+}
+
+int main()
+{	
+
+	keysetup();	
+
+	cudaMalloc(&d_ciphertexts, sizeof(unsigned char) * KATNUM * crypto_kem_CIPHERTEXTBYTES);
+	cudaMalloc(&d_c, sizeof(gf) * KATNUM * SYS_N);
+	cudaMalloc(&d_out, sizeof(gf) * KATNUM * 2 * SYS_T); 	
+	cudaMalloc(&d_locator, sizeof(gf) * KATNUM * 2 * SYS_T);
+	cudaMalloc(&d_images, sizeof(gf) * KATNUM * SYS_N);
+	cudaMalloc(&d_e, KATNUM * (SYS_N / 8) * sizeof(unsigned char));
+
+	launch(ciphertexts);
+	launch(ciphertexts1);
+	launch(ciphertexts2);
+	launch(ciphertexts3);
+	launch(ciphertexts4);
+	launch(ciphertexts5);
+	launch(ciphertexts6);
+	launch(ciphertexts7);
+	launch(ciphertexts8);
+	launch(ciphertexts9);
+
+
+	printf("Total Kernel Time : %f \n", cpu_time_used);
+	printf("Error positions printing time : %f \n", cpu_printing);
 	cudaFree(d_e_inv_LOOP_device);
 	cudaFree(d_L);	
 	cudaFree(d_c);	
 	cudaFree(d_out);
+	cudaFree(d_locator);
+	cudaFree(d_images);
+	cudaFree(d_ciphertexts);
+	cudaFree(d_e);
+
     
 	return 0;
 }
