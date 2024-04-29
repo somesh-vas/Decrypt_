@@ -3,7 +3,7 @@ CC=nvcc
 
 # Define compiler flags
 CFLAGS=-arch=sm_86
-CUDAFLAGS=-Xcompiler -Wall,-Wextra
+CUDAFLAGS=-Xcompiler -Wall,-Wextra --use_fast_math -O3 
 
 # Define libraries
 LIBS=-lcudart -lm

@@ -44,74 +44,64 @@ int main() {
     initialisation(secretkeys,ciphertexts,sk,L,g);	
 	
 	compute_inverses();
-	start = clock();
+	
+	
 	for (tv = 0; tv < KATNUM; tv++) {
 		
-		
+
+		start = clock();
+
+
 		for (i = 0; i < SYND_BYTES; i++)       r[i] = ciphertexts[tv][i];
 
 		for (i = SYND_BYTES; i < SYS_N/8; i++) r[i] = 0;
 		
 		synd(s, r);
-		// print s
-		// printf("synd s: positions");
-		for (k = 0;k < SYS_T*2;++k){
-		//  printf("%d \n",s[k]);
-		}
-		// printf("\n");
-
 		
+
+
 
 		 
 		bm(locator, s);
-		for (int i = 0; i < SYS_N; i++) {
-        // printf("%d : %d \n",i, locator[i]);
-		// printf("%d ",L[i]);
-    }
-    // printf("\n\n");
+		
 
 
 		
-		root(images, locator, L);
+		root(images, locator, L);	
 
-		// just print the images
-		// printf("decrypt images: positions");
-		for (k = 0;k < SYS_N;++k){
-		//  printf("%d ",images[k]);
-		// printf("%d ",L[k]);
-		}
-		// printf("\n");
-		// printf("\n%d\n",count);
+
+		
 
 		
 
 		for (i = 0; i < SYS_N/8; i++) 
-			e[i] = 0;
-			
+			e[i] = 0;			
 	
 		for (i = 0; i < SYS_N; i++)
 		{
-			t = gf_iszero(images[i]) & 1;
-			// printf("%d ",t);
+			t = gf_iszero(images[i]) & 1;			
 			e[ i/8 ] |= t << (i%8);
 		}
 
-    	for (k = 0;k < SYS_N;++k)
-    	  if (e[k/8] & (1 << (k&7))){
-    	    // printf(" %d",k);
-			
-		  }
-		//   printf("\n");
-    
-		
-	}
-	end = clock();
-	avg_cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
+		end = clock();
+		avg_cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
 	cpu_printing = avg_cpu_time_used / KATNUM;
 	
 	double micros = avg_cpu_time_used * 1000000; // Convert to microseconds
 
     printf("CPU time used: %.2f microseconds\n", micros);
+		
+    	for (k = 0;k < SYS_N;++k)
+    	  if (e[k/8] & (1 << (k&7))){
+    	    // printf(" %d",k);
+			
+		  }
+		  printf("\n");
+    
+		
+	}
+	
+	
 			
     return KAT_SUCCESS;
 }

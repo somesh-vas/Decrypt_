@@ -186,7 +186,7 @@ __global__ void computeOut(gf *d_inverse_elements, unsigned char *d_ciphertexts,
     int blockId = blockIdx.x + blockIdx.y * gridDim.x;
     int globalIdx = blockId * blockDim.x + tid;
 	
-
+	#pragma unroll <4>
 	if (tid < SYND_BYTES) {
 		unsigned char r = d_ciphertexts[tid];
 		// Completely unroll the loop
@@ -202,6 +202,7 @@ __global__ void computeOut(gf *d_inverse_elements, unsigned char *d_ciphertexts,
 	__syncthreads(); // Ensure 'c' is fully populated before proceeding
 
     // Compute 'out' elements in parallel
+	#pragma unroll <4>
 	if (globalIdx < 2 * SYS_T) {
 		gf sum = 0;
 		int i = 0;
@@ -316,7 +317,7 @@ __global__ void eval_root(gf *d_images) {
 
 int synd_f() {
 	
-	int threadsPerBlock = 1024;  // Max threads per block based on your device capabilities
+	int threadsPerBlock = 768;  // Max threads per block based on your device capabilities
     int totalElements = SYS_N;  // Total number of elements to be processed
     int numBlocks = (totalElements + threadsPerBlock - 1) / threadsPerBlock;  // Calculate the necessary number of blocks
 
@@ -330,9 +331,14 @@ int synd_f() {
     cudaMalloc(&d_images, 3488 * sizeof(gf));
 	cudaMalloc(&d_out2, 128 * sizeof(gf));
 	cudaMalloc(&d_e, (SYS_N + 7) / 8);
+
+	
+
 	cudaEvent_t start, stop;
-    float milliseconds = 0;
-    float microseconds = 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
 
 
 
@@ -341,20 +347,21 @@ int synd_f() {
     computeOut<<<numBlocks, threadsPerBlock>>>(d_inverse_elements, d_ciphertexts, d_images);	
 	eval_root<<<numBlocks, threadsPerBlock>>>(d_images);
     cudaDeviceSynchronize();
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-	cudaEventRecord(start);
+	
 	cudaMemcpy(images, d_images, SYS_N * sizeof(gf), cudaMemcpyDeviceToHost);
+	
 	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	cudaEventElapsedTime(&milliseconds, start, stop);
-   microseconds = milliseconds * 1000;  // Convert milliseconds to microseconds
-    printf("Time for Host to Device transfer: %f us\n", microseconds);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Kernel execution time: %f microseconds\n", milliseconds*1000);
 
-    cudaEventDestroy(stop);
+
+
+    
 
 	for (i = 0; i < SYS_N; i++) {
-		 if (images[i] != 0) printf("%d ", i);
+		if (images[i] != 0) printf("%d ", i);
 	}
 	printf("\n");
 	cudaFree(d_images);
@@ -362,6 +369,7 @@ int synd_f() {
     cudaFree(d_inverse_elements);
     // cudaFree(d_out1);
     cudaFree(d_L);
+    
     return 0;
 }
 
@@ -404,6 +412,5 @@ int main() {
 
     return KAT_SUCCESS;
 }
-
 
 
