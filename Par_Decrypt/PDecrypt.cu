@@ -354,7 +354,7 @@ int synd_f() {
     cudaEventDestroy(stop);
 
 	for (i = 0; i < SYS_N; i++) {
-		// if (images[i] != 0) printf("%d ", i);
+		 if (images[i] != 0) printf("%d ", i);
 	}
 	printf("\n");
 	cudaFree(d_images);
