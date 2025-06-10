@@ -1,2 +1,0 @@
-CPU time used: 4621.00 microseconds
-
