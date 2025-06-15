@@ -22,6 +22,7 @@
 #ifndef GF_H
 #define GF_H
 
+// #include "common.h"
 #include "common.h"
 
 #ifdef __cplusplus

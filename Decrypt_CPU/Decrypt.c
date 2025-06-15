@@ -48,14 +48,13 @@ int main() {
 	
 	for (tv = 0; tv < KATNUM; tv++) {
 		
-
 		start = clock();
-
-
+		
 		for (i = 0; i < SYND_BYTES; i++)       r[i] = ciphertexts[tv][i];
 
 		for (i = SYND_BYTES; i < SYS_N/8; i++) r[i] = 0;
-		
+		// print r
+
 		synd(s, r);
 		
 
