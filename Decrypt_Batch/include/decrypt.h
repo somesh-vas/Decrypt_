@@ -59,8 +59,8 @@ unsigned char *sk = NULL;
 int count;
 unsigned char h_error[KATNUM][SYS_N];
 
-#define GF_POLY_MOD ((1 << GFBITS) - 1)
-#define POLY_MOD    ((1 << GFBITS) - 1)
+// #define GF_POLY_MOD ((1 << GFBITS) - 1)
+// #define POLY_MOD    ((1 << GFBITS) - 1)
 
 // Device functions
 __device__ __forceinline__ gf add(gf in0, gf in1) {
@@ -94,16 +94,11 @@ __device__ __forceinline__ gf p_gf_inv(gf in) {
     return gf_inverse_table[in];
 }
 
-__device__ gf p_gf_frac(gf den, gf num) {
+__device__ __forceinline__  gf p_gf_frac(gf den, gf num) {
     return mul(p_gf_inv(den), num);
 }
 
-__device__ gf d_gf_iszero(gf a) {
-    uint32_t t = a;
-    t -= 1;
-    t >>= 19;
-    return (gf)t;
-}
+
 
 // Host initialization function
 void InitializeC() {

@@ -1,0 +1,623 @@
+// // src/cuda/Decrypt.cu
+// #include "decrypt.h"           // brings in common.h, gf.h, root.h, plus your __constant__ d_L, mne, mle[], etc.
+// #include <cuda_runtime.h>
+// #include <stdio.h>
+
+// typedef uchar4 C4;
+
+// ///////////////////////////////////////////////////////////////////////////////////////
+
+// ///////////////////////////////////////////////////////////////////////////////////////
+// // Kernel #1: compute 2*SYS_T syndromes
+// __global__ void computeSyndromesKernel(
+//     const C4*  __restrict__ d_ct4,
+//     const gf*  __restrict__ d_inverse_elements,
+//           gf*  __restrict__ d_syndromes
+// ) {
+//     extern __shared__ gf shared[];      // sb + 2*SYS_T elements
+//     gf* c     = shared;                 // [0 .. sb-1]
+//     int   tid = threadIdx.x;
+//     int   ct  = blockIdx.y;
+//     int   wordsPerCt = (SYND_BYTES + 3)/4;
+//     size_t base     = size_t(ct)*wordsPerCt;
+
+//     // 1) unpack into c[]
+//     for (int i = tid; i < sb; i += blockDim.x) c[i] = 0;
+//     __syncthreads();
+//     if (tid < wordsPerCt) {
+//         C4 v = d_ct4[base + tid];
+//         int bitBase = tid*32;
+//         #pragma unroll
+//         for (int b = 0; b < 4; ++b) {
+//             unsigned char byte = *(&v.x + b);
+//             #pragma unroll
+//             for (int bit = 0; bit < 8; ++bit) {
+//                 int idx = bitBase + b*8 + bit;
+//                 if (idx < sb) c[idx] = (byte >> bit)&1U;
+//             }
+//         }
+//     }
+//     __syncthreads();
+
+//     // 2) compute each syndrome
+//     if (tid < 2*SYS_T) {
+//         const int stride = 2*SYS_T;
+//         const gf* col    = d_inverse_elements + tid;
+//         gf sum = 0;
+//         for (int i = 0; i < sb; i++) {
+//             gf mask = gf(-int(c[i]&1));
+//             sum ^= (col[0] & mask);
+//             col += stride;
+//         }
+//         d_syndromes[ct*(2*SYS_T) + tid] = sum;
+//     }
+// }
+
+// ///////////////////////////////////////////////////////////////////////////////////////
+// // Kernel #2: run Berlekamp–Massey on each syndrome vector
+
+// __global__ void berlekampMasseyKernel(
+//     const gf* __restrict__ d_syndromes,
+//     gf* __restrict__ d_locator    // size = KATNUM*(SYS_T+1)
+// ) {
+//     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (tid >= KATNUM) return;
+
+//     const gf* s = d_syndromes + tid * (2 * SYS_T);
+//     gf* out = d_locator + tid * (SYS_T + 1);
+
+//     int i;
+
+//     uint16_t N = 0;
+//     uint16_t L = 0;
+//     uint16_t mle;
+//     uint16_t mne;
+
+//     gf T[SYS_T + 1];
+//     gf C[SYS_T + 1];
+//     gf B[SYS_T + 1];
+
+//     gf b = 1, d, f;
+
+//     for (i = 0; i <= SYS_T; i++)
+//         C[i] = B[i] = 0;
+
+//     B[1] = C[0] = 1;
+
+//     for (N = 0; N < 2 * SYS_T; N++) {
+//         d = 0;
+
+//         for (i = 0; i <= min(N, SYS_T); i++)
+//             d ^= mul(C[i], s[N - i]);
+
+//         mne = d;
+//         mne -= 1;
+//         mne >>= 15;
+//         mne -= 1;
+
+//         mle = N;
+//         mle -= 2 * L;
+//         mle >>= 15;
+//         mle -= 1;
+//         mle &= mne;
+
+//         for (i = 0; i <= SYS_T; i++)
+//             T[i] = C[i];
+
+//         f = p_gf_frac(b, d);
+
+//         for (i = 0; i <= SYS_T; i++)
+//             C[i] ^= mul(f, B[i]) & mne;
+
+//         L = (L & ~mle) | ((N + 1 - L) & mle);
+
+//         for (i = 0; i <= SYS_T; i++)
+//             B[i] = (B[i] & ~mle) | (T[i] & mle);
+
+//         b = (b & ~mle) | (d & mle);
+
+//         for (i = SYS_T; i >= 1; i--) B[i] = B[i - 1];
+//         B[0] = 0;
+//     }
+
+//     for (i = 0; i <= SYS_T; i++)
+//         out[i] = C[SYS_T - i];
+// }
+// ///////////////////////////////////////////////////////////////////////////////////////
+// // Kernel #3: Chien search — find error positions
+// __global__ void chien_search_kernel(
+//     const gf* __restrict__ d_sigma_all,
+//     unsigned char* __restrict__ d_error_all
+// ) {
+//     int cipherIdx = blockIdx.y;                                
+//     int posIdx    = blockIdx.x * blockDim.x + threadIdx.x;     
+
+//     if (posIdx >= SYS_N) return;
+
+//     // pointer to this block’s σ
+//     const gf *sigma = d_sigma_all + cipherIdx * (SYS_T + 1);
+
+//     // Horner’s method: val = σ(a) where a = d_L[posIdx]
+//     gf val = sigma[SYS_T];
+//     gf a   = d_L[posIdx];
+//     for (int j = SYS_T - 1; j >= 0; j--) {
+//         val = mul(val, a) ^ sigma[j];
+//     }
+//     // if σ(a)==0 → error at posIdx
+//     d_error_all[cipherIdx * SYS_N + posIdx] = (val == 0);
+// }
+
+// ///////////////////////////////////////////////////////////////////////////////////////
+// // Host launcher: split version + Chien search
+// void decrypt_mass_separate() {
+//     const int SYNS      = 2*SYS_T;
+//     const int LOCS      = SYS_T+1;
+//     size_t ctWords      = (SYND_BYTES+3)/4;
+//     size_t ctBytes      = size_t(KATNUM)*ctWords*sizeof(C4);
+//     size_t synBytes     = size_t(KATNUM)*SYNS*sizeof(gf);
+//     size_t locBytes     = size_t(KATNUM)*LOCS*sizeof(gf);
+//     size_t errBytes     = size_t(KATNUM)*SYS_N*sizeof(unsigned char);
+
+//     // 1) pin & upload ciphertexts as C4
+//     C4 *h_ct4 = nullptr;
+//     CHECK_CUDA(cudaMallocHost(&h_ct4, ctBytes));
+//     memcpy(h_ct4, ciphertexts,
+//            size_t(KATNUM)*crypto_kem_CIPHERTEXTBYTES);
+//     C4 *d_ct4 = nullptr;
+//     CHECK_CUDA(cudaMalloc(&d_ct4, ctBytes));
+//     CHECK_CUDA(cudaMemcpy(d_ct4, h_ct4, ctBytes,
+//                           cudaMemcpyHostToDevice));
+
+//     // 2) allocate device buffers
+//     gf  *d_synd       = nullptr, *d_loc = nullptr;
+//     unsigned char *d_error_all = nullptr;
+//     CHECK_CUDA(cudaMalloc(&d_synd, synBytes));
+//     CHECK_CUDA(cudaMalloc(&d_loc,  locBytes));
+//     CHECK_CUDA(cudaMalloc(&d_error_all, errBytes));
+
+//     // 3) launch syndrome kernel
+//     dim3 gridSyn(1, KATNUM);
+//     int threadsSyn = 256;
+//     int sharedSyn  = (sb + 2*SYS_T)*sizeof(gf);
+//     computeSyndromesKernel<<<gridSyn,threadsSyn,sharedSyn>>>(
+//          d_ct4, d_inverse_elements, d_synd
+//     );
+//     CHECK_CUDA(cudaGetLastError());
+//     CHECK_CUDA(cudaDeviceSynchronize());
+
+//     // 4) launch BM kernel
+//     dim3 gridBM(1, KATNUM);
+//     int threadsBM = max(SYS_T+1, 32);
+//     berlekampMasseyKernel<<<gridBM,threadsBM>>>(
+//          d_synd, d_loc
+//     );
+//     CHECK_CUDA(cudaGetLastError());
+//     CHECK_CUDA(cudaDeviceSynchronize());
+
+//     // 5) launch Chien search
+//     int threadsCS = 256;
+//     int blocksCS = (SYS_N + threadsCS - 1)/threadsCS;
+//     dim3 gridCS(blocksCS, KATNUM);
+//     chien_search_kernel<<<gridCS,threadsCS>>>(
+//         d_loc,
+//         d_error_all
+//     );
+//     CHECK_CUDA(cudaGetLastError());
+//     CHECK_CUDA(cudaDeviceSynchronize());
+
+//     // 6) copy back & print locator + error map
+//     // gf      *h_loc       = (gf*)malloc(locBytes);
+//     unsigned char *h_err = (unsigned char*)malloc(errBytes);
+//     // CHECK_CUDA(cudaMemcpy(h_loc,    d_loc,      locBytes,
+//     //                       cudaMemcpyDeviceToHost));
+//     CHECK_CUDA(cudaMemcpy(h_err,    d_error_all,errBytes,
+//                           cudaMemcpyDeviceToHost));
+
+//     // Print locator and error vector for each ciphertext
+//     for (int t = 0; t < KATNUM; t++) {
+
+//         for (int i = 0; i < SYS_N; i++) {
+//             if (h_err[t*SYS_N + i])
+//                 printf("%d ", i);
+//         }
+//         printf("\n");
+//     }
+
+//     // 7) cleanup
+//     // free(h_loc);
+//     free(h_err);
+//     CHECK_CUDA(cudaFreeHost(h_ct4));
+//     CHECK_CUDA(cudaFree(d_ct4));
+//     CHECK_CUDA(cudaFree(d_synd));
+//     CHECK_CUDA(cudaFree(d_loc));
+//     CHECK_CUDA(cudaFree(d_error_all));
+// }
+
+// ///////////////////////////////////////////////////////////////////////////////////////
+// int main() {
+//     initialisation(secretkeys,ciphertexts,sk,L,g);
+//     compute_inverses();
+//     InitializeC();                 
+//     decrypt_mass_separate();       // run the full pipeline
+//     return KAT_SUCCESS;
+// }
+// src/cuda/Decrypt.cu – batch McEliece decrypt (syndrome → BM → root)
+// ---------------------------------------------------------------------------
+//  * **ONLY** the Berlekamp‑Massey kernel is re‑implemented (no mne/mle tables).
+//  * End‑to‑end structure is unchanged:   computeSyndromes → BM → Chien search.
+//  * Host side now copies all three stage‐outputs back and prints them for
+//    test/debug (syndromes, σ‑locator, error positions).
+// ---------------------------------------------------------------------------
+
+#include "decrypt.h"               // KATNUM, SYS_T, SYS_N, sb, etc.
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+using C4 = uchar4;                  // four packed ciphertext bytes
+
+// ---------------------------------------------------------------------------
+#define CHECK_CUDA(x)                                                     \
+    do {                                                                 \
+        cudaError_t err__ = (x);                                         \
+        if (err__ != cudaSuccess) {                                      \
+            fprintf(stderr,"CUDA error %s @ %s:%d – %s\n",            \
+                    #x,__FILE__,__LINE__,cudaGetErrorString(err__));     \
+            exit(EXIT_FAILURE);                                          \
+        }                                                                \
+    } while (0)
+
+////////////////////////////////////////////////////////////////////////////////
+//  Kernel 1 – compute 2·t syndromes                                           //
+////////////////////////////////////////////////////////////////////////////////
+__global__ void computeSyndromesKernel(const C4 * __restrict__ d_ct4,
+                                       const gf * __restrict__ d_inv,
+                                       gf       * __restrict__ d_syn)
+{
+    extern __shared__ gf shared[];          // sb bits (0/1)
+    gf *c = shared;
+
+    const int tid      = threadIdx.x;
+    const int ct       = blockIdx.y;
+    const int wordsPer = (SYND_BYTES + 3) / 4;   // #uchar4 per ct
+    const size_t base  = static_cast<size_t>(ct) * wordsPer;
+
+    // clear shared
+    for (int i = tid; i < sb; i += blockDim.x) c[i] = 0;
+    __syncthreads();
+
+    // unpack packed ciphertext bits → c[ ]
+    if (tid < wordsPer) {
+        C4 w = d_ct4[base + tid];
+        const int bit0 = tid * 32;
+        #pragma unroll
+        for (int by = 0; by < 4; ++by) {
+            unsigned char B = *(&w.x + by);
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                int idx = bit0 + by * 8 + b;
+                if (idx < sb) c[idx] = (B >> b) & 1u;
+            }
+        }
+    }
+    __syncthreads();
+
+    // each thread (tid < 2·t) computes syndrome value
+    if (tid < 2 * SYS_T) {
+        const gf *col = d_inv + tid;
+        const int stride = 2 * SYS_T;
+        gf acc = 0;
+        for (int i = 0; i < sb; ++i) {
+            gf mask = gf(-int(c[i] & 1));
+            acc ^= (col[0] & mask);
+            col += stride;
+        }
+        d_syn[ct * (2 * SYS_T) + tid] = acc;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//  Kernel 2 – **new** branch‑free Berlekamp–Massey (no constant‑mem masks)   //
+////////////////////////////////////////////////////////////////////////////////
+// __global__ void berlekampMasseyKernel(const gf * __restrict__ d_syn,
+//                                       gf       * __restrict__ d_loc) // out σ
+// {
+//     // ---- shared scratch ---------------------------------------------------
+//     __shared__ gf C[SYS_T + 1];               // current locator σ(x)
+//     __shared__ gf B[SYS_T + 1];               // backup poly
+//     __shared__ gf warpSum[(SYS_T + 31) / 32]; // partial sums per warp
+//     __shared__ gf shiftBuf[SYS_T + 1];
+
+//     __shared__ gf b, d, f;                    // BM scalars
+//     __shared__ gf mask_ne, mask_le;           // dynamic masks
+//     __shared__ int L;                         // current degree |σ|
+
+//     const int tid   = threadIdx.x;
+//     const int ct    = blockIdx.y;             // ciphertext row
+//     const int nWarp = (SYS_T + 31) / 32;
+
+//     // ---- init: σ ← 1, B ← x ----------------------------------------------
+//     if (tid <= SYS_T) {
+//         C[tid] = (tid == 0);
+//         B[tid] = (tid == 1);
+//     }
+//     if (tid == 0) {
+//         b = 1; L = 0;
+//         for (int w = 0; w < nWarp; ++w) warpSum[w] = 0;
+//     }
+//     __syncthreads();
+
+//     // ---- main BM loop ------------------------------------------------------
+//     #pragma unroll 1
+//     for (int N = 0; N < 2 * SYS_T; ++N) {
+//         const int max_j = min(N, SYS_T);
+
+//         // ---- discrepancy d ------------------------------------------------
+//         gf part = 0;
+//         for (int j = tid; j <= max_j; j += blockDim.x)
+//             part ^= mul(C[j], d_syn[ct * (2 * SYS_T) + (N - j)]);
+//         // warp reduction
+//         for (int off = 16; off; off >>= 1)
+//             part ^= __shfl_down_sync(0xFFFFFFFFu, part, off);
+//         if ((tid & 31) == 0) warpSum[tid >> 5] = part;
+//         __syncthreads();
+
+//         if (tid == 0) {
+//             d = 0; for (int w = 0; w <= max_j / 32; ++w) d ^= warpSum[w];
+//             const bool nz  = (d != 0);
+//             const bool big = nz && (2 * L <= N);
+//             mask_ne = nz  ? (gf)0xFFFF : 0;
+//             mask_le = big ? (gf)0xFFFF : 0;
+//             f       = nz ? p_gf_frac(b, d) : 0;
+//             if (big) L = N + 1 - L;
+//             b = (b & ~mask_le) | (d & mask_le);
+//         }
+//         __syncthreads();
+
+//         // ---- update σ & B --------------------------------------------------
+//         if (tid <= SYS_T) {
+//             gf oldC = C[tid];
+//             gf oldB = B[tid];
+//             C[tid] = oldC ^ (mul(f, oldB) & mask_ne);
+//             B[tid] = (oldB & ~mask_le) | (oldC & mask_le);
+//         }
+//         __syncthreads();
+
+//         // ---- shift B ← x·B -------------------------------------------------
+//         if (tid <= SYS_T) shiftBuf[tid] = (tid ? B[tid - 1] : 0);
+//         __syncthreads();
+//         if (tid <= SYS_T) B[tid] = shiftBuf[tid];
+//         __syncthreads();
+//     }
+
+//     // ---- write σ (reversed order) ----------------------------------------
+//     if (tid <= SYS_T) d_loc[ct * (SYS_T + 1) + tid] = C[SYS_T - tid];
+// }
+// -------------------------------------------------------------------------
+//  Optimised BM kernel – Opt-1 (warp-friendly block size) + Opt-6 (__ldg)
+// -------------------------------------------------------------------------
+#ifndef PAD32           // pad so (SYS_T+1+PAD32) is a multiple of 32
+#define PAD32  (( ((SYS_T+1) & 31) ? (32 - ((SYS_T+1) & 31)) : 0 ))
+#endif
+
+__global__ void berlekampMasseyKernel_opt(
+    const gf *__restrict__ d_syn,
+          gf *__restrict__ d_loc )
+{
+    // ───────── shared scratch (now padded to avoid 32-bank wrap) ──────────
+    __shared__ gf C [SYS_T + 1 + PAD32];
+    __shared__ gf B [SYS_T + 1 + PAD32];
+    __shared__ gf Wsum[(SYS_T + 31) / 32];
+    __shared__ gf shShift[SYS_T + 1];
+
+    __shared__ gf b, d, f, mask_ne, mask_le;
+    __shared__ int L;
+
+    const int tid   = threadIdx.x;
+    const int ct    = blockIdx.y;
+    const int nWarp = (SYS_T + 31) / 32;
+
+    // ───────── initialisation ─────────
+    if (tid <= SYS_T) {
+        C[tid] = (tid == 0);
+        B[tid] = (tid == 1);
+    }
+    if (tid == 0) { b = 1;  L = 0; }
+    if (tid < nWarp) Wsum[tid] = 0;
+    __syncthreads();
+
+    // ───────── main loop ─────────
+    #pragma unroll 1
+    for (int N = 0; N < 2 * SYS_T; ++N) {
+        const int jmax = min(N, SYS_T);
+
+        // 1) discrepancy d
+        gf part = 0;
+        for (int j = tid; j <= jmax; j += blockDim.x)
+            part ^= mul(C[j], __ldg(&d_syn[ct * (2 * SYS_T) + (N - j)]));
+        // warp reduction
+        for (int off = 16; off; off >>= 1)
+            part ^= __shfl_down_sync(0xffffffffu, part, off);
+        if ((tid & 31) == 0) Wsum[tid >> 5] = part;
+        __syncthreads();
+
+        if (tid == 0) {
+            d = 0;  for (int w = 0; w <= jmax / 32; ++w) d ^= Wsum[w];
+
+            const bool nz  = (d != 0);
+            const bool le  = nz && (2 * L <= N);
+
+            mask_ne = nz ? gf(0xffff) : 0;
+            mask_le = le ? gf(0xffff) : 0;
+
+            f = nz ? p_gf_frac(b, d) : 0;
+            if (le) L = N + 1 - L;
+            b = (b & ~mask_le) | (d & mask_le);
+        }
+        __syncthreads();
+
+        // 2) update C & B
+        if (tid <= SYS_T) {
+            gf oldC = C[tid], oldB = B[tid];
+            C[tid] = oldC ^ (mul(f, oldB) & mask_ne);
+            B[tid] = (oldB & ~mask_le) | (oldC & mask_le);
+        }
+        __syncthreads();
+
+        // 3) shift B ← x·B
+        if (tid <= SYS_T) shShift[tid] = (tid ? B[tid - 1] : 0);
+        __syncthreads();
+        if (tid <= SYS_T) B[tid] = shShift[tid];
+        __syncthreads();
+    }
+
+    if (tid <= SYS_T) d_loc[ct * (SYS_T + 1) + tid] = C[SYS_T - tid];
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//  Kernel 3 – Chien search                                                   //
+////////////////////////////////////////////////////////////////////////////////
+// __global__ void chien_search_kernel(const gf * __restrict__ d_loc,
+//                                     unsigned char * __restrict__ d_err)
+// {
+//     const int ct  = blockIdx.y;
+//     const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (pos >= SYS_N) return;
+
+//     const gf *sigma = d_loc + ct * (SYS_T + 1);
+//     gf a   = d_L[pos];
+//     gf val = sigma[SYS_T];
+//     for (int j = SYS_T - 1; j >= 0; --j) val = mul(val, a) ^ sigma[j];
+//     d_err[ct * SYS_N + pos] = (val == 0);
+// }
+__global__
+void chien_search_kernel(
+    const gf* __restrict__ d_sigma_all,    // KATNUM × (SYS_T+1)
+    unsigned char* __restrict__ d_error_all // KATNUM × SYS_N
+) {
+    int cipherIdx = blockIdx.y;
+    int posIdx    = blockIdx.x * blockDim.x + threadIdx.x;
+    if (posIdx >= SYS_N) return;
+
+    const gf* sigma = d_sigma_all + cipherIdx * (SYS_T + 1);
+
+    // Horner’s method: evaluate σ(a) at a = c_L[posIdx]
+    gf val = 1;
+    gf a   = d_L[posIdx];
+    for (int j = SYS_T - 1; j >= 0; j--) {
+        uint32_t t0 = val, t1 = a, tmp = t0 * (t1 & 1u);
+        for (int b = 1; b < GFBITS; b++) {
+            tmp ^= (t0 * (t1 & (1u << b)));
+        }
+        uint32_t t = tmp & 0x7FC000;
+        tmp ^= t >>  9; tmp ^= t >> 12;
+        t    = tmp & 0x3000;
+        tmp ^= t >>  9; tmp ^= t >> 12;
+        val = (gf)(tmp & GFMASK);
+        val ^= sigma[j];
+    }
+    d_error_all[cipherIdx * SYS_N + posIdx] = (val == 0) ? 1 : 0;
+}
+////////////////////////////////////////////////////////////////////////////////
+//  Host pipeline                                                             //
+////////////////////////////////////////////////////////////////////////////////
+static void decrypt_mass_separate(void)
+{
+    const int SYNS  = 2 * SYS_T;
+    const int LOCS  = SYS_T + 1;
+    const int words = (SYND_BYTES + 3) / 4;
+
+    const size_t packedCtBytes = size_t(KATNUM) * words * sizeof(C4);
+    const size_t synBytes      = size_t(KATNUM) * SYNS * sizeof(gf);
+    const size_t locBytes      = size_t(KATNUM) * LOCS * sizeof(gf);
+    const size_t errBytes      = size_t(KATNUM) * SYS_N * sizeof(unsigned char);
+
+    // ---- host buffers -----------------------------------------------------
+    C4 *h_ct4 = (C4 *)malloc(packedCtBytes);
+    memset(h_ct4, 0, packedCtBytes);
+
+    for (int ct = 0; ct < KATNUM; ++ct) {
+        const unsigned char *src = &ciphertexts[ct][0];   // row pointer → uchar*
+        memcpy(reinterpret_cast<unsigned char *>(h_ct4) + ct * words * 4,
+               src, crypto_kem_CIPHERTEXTBYTES);
+    }
+
+    gf *h_syn = (gf *)malloc(synBytes);
+    gf *h_loc = (gf *)malloc(locBytes);
+    unsigned char *h_err = (unsigned char *)malloc(errBytes);
+
+    // ---- device buffers ---------------------------------------------------
+    C4 *d_ct4   = nullptr; CHECK_CUDA(cudaMalloc(&d_ct4, packedCtBytes));
+    gf *d_syn   = nullptr; CHECK_CUDA(cudaMalloc(&d_syn, synBytes));
+    gf *d_loc   = nullptr; CHECK_CUDA(cudaMalloc(&d_loc, locBytes));
+    unsigned char *d_err = nullptr; CHECK_CUDA(cudaMalloc(&d_err, errBytes));
+
+    CHECK_CUDA(cudaMemcpy(d_ct4, h_ct4, packedCtBytes, cudaMemcpyHostToDevice));
+
+    // ---- Kernel 1 ---------------------------------------------------------
+    dim3 gridSyn(1, KATNUM);
+    const int threadsSyn = 256;
+    const int shSyn      = (sb + 2 * SYS_T) * sizeof(gf);
+    computeSyndromesKernel<<<gridSyn, threadsSyn, shSyn>>>(d_ct4, d_inverse_elements, d_syn);
+    CHECK_CUDA(cudaGetLastError());
+
+    // ---- Kernel 2 ---------------------------------------------------------
+    // dim3 gridBM(1, KATNUM);
+    // const int threadsBM = max(SYS_T + 1, 32);
+    // berlekampMasseyKernel<<<gridBM, threadsBM>>>(d_syn, d_loc);
+    // round block size UP to the next multiple of 32
+    const int threadsBM = ((SYS_T + 1 + 31) & ~31);
+    berlekampMasseyKernel_opt<<< dim3(1, KATNUM), threadsBM >>>(d_syn, d_loc);
+
+    CHECK_CUDA(cudaGetLastError());
+
+    // ---- Kernel 3 ---------------------------------------------------------
+    const int threadsCS = 256;
+    const int blocksCS  = (SYS_N + threadsCS - 1) / threadsCS;
+    dim3 gridCS(blocksCS, KATNUM);
+    chien_search_kernel<<<gridCS, threadsCS>>>(d_loc, d_err);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // ---- copy results back ------------------------------------------------
+    // CHECK_CUDA(cudaMemcpy(h_syn, d_syn, synBytes, cudaMemcpyDeviceToHost));
+    // CHECK_CUDA(cudaMemcpy(h_loc, d_loc, locBytes, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_err, d_err, errBytes, cudaMemcpyDeviceToHost));
+
+    // ---- print (syndromes, locator, error positions) ----------------------
+    // for (int ct = 0; ct < KATNUM; ++ct) {
+    // // printf("Syndrome %d: ", ct);
+    // // for (int i = 0; i < SYNS; ++i) printf("%04x ", h_syn[ct * SYNS + i]);
+    // // printf("\nLocator  %d: ", ct);
+    // // for (int i = 0; i < LOCS; ++i) printf("%04x ", h_loc[ct * LOCS + i]);
+    // // printf("\nErrors   %d: ", ct);
+    //     for (int i = 0; i < SYS_N; ++i) if (h_err[ct * SYS_N + i]) printf("%d ", i);
+    //     printf("\n");
+    // }
+
+    // ---- cleanup ----------------------------------------------------------
+    free(h_ct4); free(h_syn); free(h_loc); free(h_err);
+    CHECK_CUDA(cudaFree(d_ct4));
+    CHECK_CUDA(cudaFree(d_syn));
+    CHECK_CUDA(cudaFree(d_loc));
+    CHECK_CUDA(cudaFree(d_err));
+    //reset the device
+    CHECK_CUDA(cudaDeviceReset());
+    // exit(EXIT_SUCCESS); // not needed, as we return from main()
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//  main – build field tables, then call pipeline                              //
+////////////////////////////////////////////////////////////////////////////////
+int main(void)
+{
+    initialisation(secretkeys, ciphertexts, sk, L, g); // project helper
+    compute_inverses();   // fills d_inverse_elements
+    InitializeC();        // fills d_L[]
+
+    decrypt_mass_separate();
+    return 0;
+}
