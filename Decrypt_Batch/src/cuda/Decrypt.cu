@@ -185,26 +185,174 @@ void chien_search_kernel(
 
 
 
-void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]) {
-    const int total      = KATNUM;
-    const int batchSize  = BATCH_SIZE;
-    const int numStreams = 4;
+// void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]) {
+//     const int total      = KATNUM;
+//     const int batchSize  = BATCH_SIZE;
+//     const int numStreams = 4;
 
-    // Shared kernel inputs (reused per stream)
-    cudaStream_t streams[numStreams];
-    unsigned char *d_ct[numStreams];
-    gf           *d_syn[numStreams], *d_loc[numStreams];
-    unsigned char *d_err[numStreams], *h_err_batch[numStreams];
+//     // Shared kernel inputs (reused per stream)
+//     cudaStream_t streams[numStreams];
+//     unsigned char *d_ct[numStreams];
+//     gf           *d_syn[numStreams], *d_loc[numStreams];
+//     unsigned char *d_err[numStreams], *h_err_batch[numStreams];
 
-    for (int i = 0; i < numStreams; ++i) {
-        CUDA_CHECK(cudaStreamCreate(&streams[i]));
+//     for (int i = 0; i < numStreams; ++i) {
+//         CUDA_CHECK(cudaStreamCreate(&streams[i]));
 
-        CUDA_CHECK(cudaMalloc(&d_ct[i],   batchSize * crypto_kem_CIPHERTEXTBYTES));
-        CUDA_CHECK(cudaMalloc(&d_syn[i],  batchSize * 2 * SYS_T * sizeof(gf)));
-        CUDA_CHECK(cudaMalloc(&d_loc[i],  batchSize * (SYS_T + 1) * sizeof(gf)));
-        CUDA_CHECK(cudaMalloc(&d_err[i],  batchSize * SYS_N * sizeof(unsigned char)));
-        CUDA_CHECK(cudaMallocHost(&h_err_batch[i], batchSize * SYS_N * sizeof(unsigned char)));
-    }
+//         CUDA_CHECK(cudaMalloc(&d_ct[i],   batchSize * crypto_kem_CIPHERTEXTBYTES));
+//         CUDA_CHECK(cudaMalloc(&d_syn[i],  batchSize * 2 * SYS_T * sizeof(gf)));
+//         CUDA_CHECK(cudaMalloc(&d_loc[i],  batchSize * (SYS_T + 1) * sizeof(gf)));
+//         CUDA_CHECK(cudaMalloc(&d_err[i],  batchSize * SYS_N * sizeof(unsigned char)));
+//         CUDA_CHECK(cudaMallocHost(&h_err_batch[i], batchSize * SYS_N * sizeof(unsigned char)));
+//     }
+
+//     float totalH2Dms = 0.0f;
+//     float totalD2Hms = 0.0f;
+//     float totalKernelMs = 0.0f;
+//     float totalBatchMs = 0.0f;
+
+//     int batchCount = (total + batchSize - 1) / batchSize;
+
+//     for (int b = 0; b < batchCount; ++b) {
+//         int streamId    = b % numStreams;
+//         cudaStream_t s  = streams[streamId];
+//         int offset      = b * batchSize;
+//         int actualBatch = (offset + batchSize > total) ? (total - offset) : batchSize;
+
+//         // Events
+//         cudaEvent_t evH2DStart, evH2DStop;
+//         cudaEvent_t evKernelStart, evKernelStop;
+//         cudaEvent_t evD2HStart, evD2HStop;
+//         cudaEvent_t evBatchStart, evBatchStop;
+
+//         cudaEventCreate(&evH2DStart);     cudaEventCreate(&evH2DStop);
+//         cudaEventCreate(&evKernelStart);  cudaEventCreate(&evKernelStop);
+//         cudaEventCreate(&evD2HStart);     cudaEventCreate(&evD2HStop);
+//         cudaEventCreate(&evBatchStart);   cudaEventCreate(&evBatchStop);
+
+//         // (1) Start total batch timer
+//         cudaEventRecord(evBatchStart, s);
+
+//         // (2) H2D transfer
+//         cudaEventRecord(evH2DStart, s);
+//         CUDA_CHECK(cudaMemcpyAsync(
+//             d_ct[streamId],
+//             &ciphertexts[offset],
+//             actualBatch * crypto_kem_CIPHERTEXTBYTES,
+//             cudaMemcpyHostToDevice,
+//             s
+//         ));
+//         cudaEventRecord(evH2DStop, s);
+
+//         // (3) Kernel launch
+//         cudaEventRecord(evKernelStart, s);
+
+//         computeSyndromesKernel<<<
+//             dim3(1, actualBatch), 256, sb * sizeof(gf), s
+//         >>>((C4*)d_ct[streamId], d_inverse_elements, d_syn[streamId]);
+//         CUDA_CHECK(cudaGetLastError());
+
+//         berlekampMasseyKernel<<<
+//             dim3(1, actualBatch),
+//             ((SYS_T + 1 + 31) & ~31),
+//             0, s
+//         >>>(d_syn[streamId], d_loc[streamId]);
+//         CUDA_CHECK(cudaGetLastError());
+
+//         chien_search_kernel<<<
+//             dim3((SYS_N + 255) / 256, actualBatch),
+//             256,
+//             (SYS_T + 1) * sizeof(gf),
+//             s
+//         >>>(d_loc[streamId], d_err[streamId]);
+//         CUDA_CHECK(cudaGetLastError());
+
+//         cudaEventRecord(evKernelStop, s);
+
+//         // (4) D2H copy
+//         cudaEventRecord(evD2HStart, s);
+//         CUDA_CHECK(cudaMemcpyAsync(
+//             h_err_batch[streamId],
+//             d_err[streamId],
+//             actualBatch * SYS_N * sizeof(unsigned char),
+//             cudaMemcpyDeviceToHost,
+//             s
+//         ));
+//         cudaEventRecord(evD2HStop, s);
+
+//         // (5) End batch
+//         cudaEventRecord(evBatchStop, s);
+
+//         // (6) Launch async write-to-disk on host after sync
+//         cudaStreamSynchronize(s);  // required before accessing h_err_batch
+
+//         // Measure times
+//         float h2dMs = 0, d2hMs = 0, kernelMs = 0, batchMs = 0;
+//         cudaEventElapsedTime(&h2dMs,     evH2DStart,    evH2DStop);
+//         cudaEventElapsedTime(&kernelMs,  evKernelStart, evKernelStop);
+//         cudaEventElapsedTime(&d2hMs,     evD2HStart,    evD2HStop);
+//         cudaEventElapsedTime(&batchMs,   evBatchStart,  evBatchStop);
+
+//         totalH2Dms     += h2dMs;
+//         totalD2Hms     += d2hMs;
+//         totalKernelMs  += kernelMs;
+//         totalBatchMs   += batchMs;
+
+//         float throughput = actualBatch * 1000.f / batchMs;
+//         printf("[Batch %2d] Total: %.2f ms | H2D: %.2f ms | Kernel: %.2f ms | D2H: %.2f ms → %.2f cw/s\n",
+//                b, batchMs, h2dMs, kernelMs, d2hMs, throughput);
+
+//         // Write output to file
+//         char filename[128];
+//         snprintf(filename, sizeof(filename), "Output/errorstream%d.bin", b);
+//         FILE *fout = fopen(filename, "wb");
+//         if (!fout) {
+//             perror("Error writing batch result");
+//             exit(EXIT_FAILURE);
+//         }
+//         fwrite(h_err_batch[streamId], sizeof(unsigned char), actualBatch * SYS_N, fout);
+//         fclose(fout);
+
+//         // Cleanup events for this batch
+//         cudaEventDestroy(evH2DStart);     cudaEventDestroy(evH2DStop);
+//         cudaEventDestroy(evKernelStart);  cudaEventDestroy(evKernelStop);
+//         cudaEventDestroy(evD2HStart);     cudaEventDestroy(evD2HStop);
+//         cudaEventDestroy(evBatchStart);   cudaEventDestroy(evBatchStop);
+//     }
+
+//     // Final cleanup
+//     for (int i = 0; i < numStreams; ++i) {
+//         CUDA_CHECK(cudaFree(d_ct[i]));
+//         CUDA_CHECK(cudaFree(d_syn[i]));
+//         CUDA_CHECK(cudaFree(d_loc[i]));
+//         CUDA_CHECK(cudaFree(d_err[i]));
+//         CUDA_CHECK(cudaFreeHost(h_err_batch[i]));
+//         CUDA_CHECK(cudaStreamDestroy(streams[i]));
+//     }
+
+//     cudaDeviceReset();
+
+//     // Print final summary
+//     printf("\n===== Summary =====\n");
+//     printf("Total Host→Device (H2D) transfer time : %.2f ms\n", totalH2Dms);
+//     printf("Total Device→Host (D2H) transfer time : %.2f ms\n", totalD2Hms);
+//     printf("Total Kernel execution time           : %.2f ms\n", totalKernelMs);
+//     printf("Total End-to-End batch time           : %.2f ms\n", totalBatchMs);
+// }
+void decrypt(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]) {
+    const int total     = KATNUM;
+    const int batchSize = BATCH_SIZE;
+
+    // Single kernel input/output buffers
+    unsigned char *d_ct;
+    gf           *d_syn, *d_loc;
+    unsigned char *d_err, *h_err_batch;
+
+    CUDA_CHECK(cudaMalloc(&d_ct,   batchSize * crypto_kem_CIPHERTEXTBYTES));
+    CUDA_CHECK(cudaMalloc(&d_syn,  batchSize * 2 * SYS_T * sizeof(gf)));
+    CUDA_CHECK(cudaMalloc(&d_loc,  batchSize * (SYS_T + 1) * sizeof(gf)));
+    CUDA_CHECK(cudaMalloc(&d_err,  batchSize * SYS_N * sizeof(unsigned char)));
+    CUDA_CHECK(cudaMallocHost(&h_err_batch, batchSize * SYS_N * sizeof(unsigned char)));
 
     float totalH2Dms = 0.0f;
     float totalD2Hms = 0.0f;
@@ -214,8 +362,6 @@ void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHE
     int batchCount = (total + batchSize - 1) / batchSize;
 
     for (int b = 0; b < batchCount; ++b) {
-        int streamId    = b % numStreams;
-        cudaStream_t s  = streams[streamId];
         int offset      = b * batchSize;
         int actualBatch = (offset + batchSize > total) ? (total - offset) : batchSize;
 
@@ -231,60 +377,54 @@ void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHE
         cudaEventCreate(&evBatchStart);   cudaEventCreate(&evBatchStop);
 
         // (1) Start total batch timer
-        cudaEventRecord(evBatchStart, s);
+        cudaEventRecord(evBatchStart);
 
         // (2) H2D transfer
-        cudaEventRecord(evH2DStart, s);
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_ct[streamId],
+        cudaEventRecord(evH2DStart);
+        CUDA_CHECK(cudaMemcpy(
+            d_ct,
             &ciphertexts[offset],
             actualBatch * crypto_kem_CIPHERTEXTBYTES,
-            cudaMemcpyHostToDevice,
-            s
+            cudaMemcpyHostToDevice
         ));
-        cudaEventRecord(evH2DStop, s);
+        cudaEventRecord(evH2DStop);
 
         // (3) Kernel launch
-        cudaEventRecord(evKernelStart, s);
+        cudaEventRecord(evKernelStart);
 
         computeSyndromesKernel<<<
-            dim3(1, actualBatch), 256, sb * sizeof(gf), s
-        >>>((C4*)d_ct[streamId], d_inverse_elements, d_syn[streamId]);
+            dim3(1, actualBatch), 256, sb * sizeof(gf)
+        >>>((C4*)d_ct, d_inverse_elements, d_syn);
         CUDA_CHECK(cudaGetLastError());
 
         berlekampMasseyKernel<<<
             dim3(1, actualBatch),
-            ((SYS_T + 1 + 31) & ~31),
-            0, s
-        >>>(d_syn[streamId], d_loc[streamId]);
+            ((SYS_T + 1 + 31) & ~31)
+        >>>(d_syn, d_loc);
         CUDA_CHECK(cudaGetLastError());
 
         chien_search_kernel<<<
             dim3((SYS_N + 255) / 256, actualBatch),
-            256,
-            (SYS_T + 1) * sizeof(gf),
-            s
-        >>>(d_loc[streamId], d_err[streamId]);
+            512,
+            (SYS_T + 1) * sizeof(gf)
+        >>>(d_loc, d_err);
         CUDA_CHECK(cudaGetLastError());
 
-        cudaEventRecord(evKernelStop, s);
+        cudaEventRecord(evKernelStop);
 
         // (4) D2H copy
-        cudaEventRecord(evD2HStart, s);
-        CUDA_CHECK(cudaMemcpyAsync(
-            h_err_batch[streamId],
-            d_err[streamId],
+        cudaEventRecord(evD2HStart);
+        CUDA_CHECK(cudaMemcpy(
+            h_err_batch,
+            d_err,
             actualBatch * SYS_N * sizeof(unsigned char),
-            cudaMemcpyDeviceToHost,
-            s
+            cudaMemcpyDeviceToHost
         ));
-        cudaEventRecord(evD2HStop, s);
+        cudaEventRecord(evD2HStop);
 
         // (5) End batch
-        cudaEventRecord(evBatchStop, s);
-
-        // (6) Launch async write-to-disk on host after sync
-        cudaStreamSynchronize(s);  // required before accessing h_err_batch
+        cudaEventRecord(evBatchStop);
+        cudaEventSynchronize(evBatchStop); // Required for elapsed time measurement
 
         // Measure times
         float h2dMs = 0, d2hMs = 0, kernelMs = 0, batchMs = 0;
@@ -310,10 +450,10 @@ void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHE
             perror("Error writing batch result");
             exit(EXIT_FAILURE);
         }
-        fwrite(h_err_batch[streamId], sizeof(unsigned char), actualBatch * SYS_N, fout);
+        fwrite(h_err_batch, sizeof(unsigned char), actualBatch * SYS_N, fout);
         fclose(fout);
 
-        // Cleanup events for this batch
+        // Cleanup events
         cudaEventDestroy(evH2DStart);     cudaEventDestroy(evH2DStop);
         cudaEventDestroy(evKernelStart);  cudaEventDestroy(evKernelStop);
         cudaEventDestroy(evD2HStart);     cudaEventDestroy(evD2HStop);
@@ -321,18 +461,15 @@ void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHE
     }
 
     // Final cleanup
-    for (int i = 0; i < numStreams; ++i) {
-        CUDA_CHECK(cudaFree(d_ct[i]));
-        CUDA_CHECK(cudaFree(d_syn[i]));
-        CUDA_CHECK(cudaFree(d_loc[i]));
-        CUDA_CHECK(cudaFree(d_err[i]));
-        CUDA_CHECK(cudaFreeHost(h_err_batch[i]));
-        CUDA_CHECK(cudaStreamDestroy(streams[i]));
-    }
+    CUDA_CHECK(cudaFree(d_ct));
+    CUDA_CHECK(cudaFree(d_syn));
+    CUDA_CHECK(cudaFree(d_loc));
+    CUDA_CHECK(cudaFree(d_err));
+    CUDA_CHECK(cudaFreeHost(h_err_batch));
 
     cudaDeviceReset();
 
-    // Print final summary
+    // Final summary
     printf("\n===== Summary =====\n");
     printf("Total Host→Device (H2D) transfer time : %.2f ms\n", totalH2Dms);
     printf("Total Device→Host (D2H) transfer time : %.2f ms\n", totalD2Hms);
@@ -347,10 +484,7 @@ int main(void)
     initialisation(secretkeys, ciphertexts, sk, L, g);
     compute_inverses();
     InitializeC();
-    // decrypt_mass_pipelined(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]);
-    // decrypt_mass_pipelined(ciphertexts);
-    decrypt_mass_streamed_to_disk(ciphertexts);
-    cudaDeviceReset();
+    decrypt(ciphertexts);
     return 0;
 }
 // -----------------------------------------------------------------------------
