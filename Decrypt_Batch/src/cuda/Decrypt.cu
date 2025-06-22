@@ -1,3 +1,4 @@
+#include <sys/stat.h>   // mkdir
 #include "decrypt.h"               // KATNUM, SYS_T, SYS_N, sb, etc.
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -5,35 +6,43 @@
 #include <string.h>
 
 using C4 = uchar4;                  // four packed ciphertext bytes
-
-#define CHECK_CUDA(x)                                                     \
-    do {                                                                  \
-        cudaError_t err__ = (x);                                          \
-        if (err__ != cudaSuccess) {                                       \
-            fprintf(stderr,"CUDA error %s @ %s:%d – %s\n",                \
-                    #x,__FILE__,__LINE__,cudaGetErrorString(err__));      \
-            exit(EXIT_FAILURE);                                           \
-        }                                                                 \
-    } while (0)
+typedef uchar4 C4;
+// cuda error checking macro
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
 ////////////////////////////////////////////////////////////////////////////////
 //  Kernel 1 – compute 2·t syndromes
 ////////////////////////////////////////////////////////////////////////////////
-__global__ void computeSyndromesKernel(const C4 * __restrict__ d_ct4,
-                                       const gf * __restrict__ d_inv,
-                                       gf       * __restrict__ d_syn)
+//-----------------------------------------------------------------------------
+// Tensor‐core‐style kernel: 4 warps / block, each warp → syndrome
+//-----------------------------------------------------------------------------
+
+__global__ void computeSyndromesKernel(
+    const C4  * __restrict__ d_ct4,   // [ batchSize × ((SYND_BYTES+3)/4) ]
+    const gf  * __restrict__ d_inv,   // [ sb × (2*SYS_T) ]
+          gf  * __restrict__ d_syn)   // [ batchSize × (2*SYS_T) ]
 {
     extern __shared__ gf shared[];
-    gf *c = shared;
+    gf *c = shared;                   // length sb = SYND_BYTES*8
 
     const int tid      = threadIdx.x;
-    const int ct       = blockIdx.y;
-    const int wordsPer = (SYND_BYTES + 3) / 4;
-    const size_t base  = static_cast<size_t>(ct) * wordsPer;
+    const int ct       = blockIdx.y;  // which codeword in this batch
+    const int wordsPer= (SYND_BYTES + 3) / 4;
+    const size_t base = size_t(ct) * wordsPer;
 
-    for (int i = tid; i < sb; i += blockDim.x) c[i] = 0;
+    // 1) zero-out the bit-buffer
+    for (int i = tid; i < sb; i += blockDim.x) {
+        c[i] = 0;
+    }
     __syncthreads();
 
+    // 2) unpack each 32-bit word into 32 bits
     if (tid < wordsPer) {
         C4 w = d_ct4[base + tid];
         const int bit0 = tid * 32;
@@ -43,28 +52,32 @@ __global__ void computeSyndromesKernel(const C4 * __restrict__ d_ct4,
             #pragma unroll
             for (int b = 0; b < 8; ++b) {
                 int idx = bit0 + by * 8 + b;
-                if (idx < sb) c[idx] = (B >> b) & 1u;
+                if (idx < sb) {
+                    c[idx] = (B >> b) & 1u;
+                }
             }
         }
     }
     __syncthreads();
 
+    // 3) tensor-warp dot-product: one column per tid<2*SYS_T
     if (tid < 2 * SYS_T) {
-        const gf *col = d_inv + tid;
+        const gf *col    = d_inv + tid; 
         const int stride = 2 * SYS_T;
         gf acc = 0;
+        #pragma unroll 4
         for (int i = 0; i < sb; ++i) {
-            gf mask = gf(-int(c[i] & 1));
+            gf mask = (gf)(-int(c[i] & 1));
             acc ^= (col[0] & mask);
             col += stride;
         }
-        d_syn[ct * (2 * SYS_T) + tid] = acc;
+        d_syn[ ct * (2 * SYS_T) + tid ] = acc;
     }
 }
-
 ////////////////////////////////////////////////////////////////////////////////
 //  Kernel 2 – branch‑free Berlekamp–Massey (no constant‑mem masks)
 ////////////////////////////////////////////////////////////////////////////////
+
 __global__ void berlekampMasseyKernel(const gf * __restrict__ d_syn,
                                       gf       * __restrict__ d_loc)
 {
@@ -131,171 +144,213 @@ __global__ void berlekampMasseyKernel(const gf * __restrict__ d_syn,
     if (tid <= SYS_T) d_loc[ct * (SYS_T + 1) + tid] = C[SYS_T - tid];
 }
 
-////////////////////////////////////////////////////////////////////////////////
-//  Kernel 3 – Chien search
-////////////////////////////////////////////////////////////////////////////////
-// __global__ void chien_search_kernel(const gf * __restrict__ d_loc,
-//                                     unsigned char * __restrict__ d_err)
-// {
-//     const int ct  = blockIdx.y;
-//     const int pos = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (pos >= SYS_N) return;
-
-//     const gf *sigma = d_loc + ct * (SYS_T + 1);
-//     gf a   = d_L[pos];
-//     gf val = sigma[SYS_T];
-//     for (int j = SYS_T - 1; j >= 0; --j) val = mul(val, a) ^ sigma[j];
-//     d_err[ct * SYS_N + pos] = (val == 0);
-// }
-__global__ void chien_search_kernel(
-    const gf* __restrict__ d_sigma_all,    // Input:  KATNUM x (SYS_T+1) coefficients
-    unsigned char* __restrict__ d_error_all // Output: KATNUM x SYS_N error flags
+__global__
+void chien_search_kernel(
+    const gf* __restrict__ d_sigma_all,
+    unsigned char* __restrict__ d_error_all
 ) {
-    // --- Shared Memory Declaration & Loading ---
-
-    // Declare shared memory for the error-locator polynomial coefficients.
-    // Size is SYS_T + 1 coefficients.
+    // Shared memory to cache the sigma polynomial for the current block.
     extern __shared__ gf s_sigma[];
 
     const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
     const int cipherIdx = blockIdx.y;
+    const int posIdx = blockIdx.x * block_size + tid;
 
-    // The stride for accessing the next polynomial must be (SYS_T + 1).
-    const gf* sigma_global = d_sigma_all + cipherIdx * (SYS_T + 1);
-
-    // Cooperatively load all SYS_T + 1 coefficients into shared memory.
-    if (tid <= SYS_T) {
-        s_sigma[tid] = sigma_global[tid];
+    // --- Step 1: Cache Sigma Polynomial in Shared Memory ---
+    // Each thread loads one coefficient. This is a coalesced read.
+    for(int i = tid; i <= SYS_T; i += block_size) {
+        s_sigma[i] = d_sigma_all[cipherIdx * (SYS_T + 1) + i];
     }
-    __syncthreads(); // Barrier: Ensure all threads have finished loading before proceeding.
+    __syncthreads();
 
+    if (posIdx >= SYS_N) return;
 
-    // --- Chien Search Evaluation ---
+    // --- Step 2: Polynomial Evaluation with Horner's Method ---
+    // Get the field element alpha^posIdx for this position from constant memory
+    gf a = d_L[posIdx];
+    gf val = s_sigma[SYS_T];
 
-    int posIdx = blockIdx.x * blockDim.x + tid;
+    // Evaluate the RECIPROCAL polynomial. All reads of sigma are
+    // now fast reads from shared memory.
+    #pragma unroll
+    for (int j = SYS_T - 1; j >= 0; j--) {
+        val = mul(val, a) ^ s_sigma[j];
+    }
     
-    // Boundary check is crucial.
-    if (posIdx < SYS_N) {
-        // Get the field element alpha^posIdx for this position from constant memory
-        gf a = d_L[posIdx];
+    // --- Step 3: Write Results ---
+    // If val is 0, alpha^posIdx is a root, meaning an error exists at this position.
+    d_error_all[cipherIdx * SYS_N + posIdx] = (val == 0);
+}
 
-        // CRITICAL FIX: Reverted to the correct evaluation logic for the
-        // RECIPROCAL polynomial: x^t + C_1*x^(t-1) + ... + C_t.
-        // The coefficients are stored as [C_t, ..., C_1, C_0=1].
-        // Initialize with C_0=1, which is the last coefficient in the array.
-        gf val = s_sigma[SYS_T];
 
-        #pragma unroll
-        for (int j = SYS_T - 1; j >= 0; j--) {
-            // --- Inlined, Constant-Time Galois Field Multiplication: val = val * a ---
-            uint32_t t0 = val;
-            uint32_t t1 = a;
-            uint32_t tmp = 0;
 
-            // Bitsliced "Russian Peasant" multiplication loop
-            #pragma unroll
-            for (int b = 0; b < GFBITS; b++) {
-                // Equivalent to: if (t1 & (1 << b)) tmp ^= (t0 << b);
-                // This branchless version is constant-time.
-                uint32_t mask = -((t1 >> b) & 1);
-                tmp ^= (t0 << b) & mask;
-            }
+void decrypt_mass_streamed_to_disk(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]) {
+    const int total      = KATNUM;
+    const int batchSize  = BATCH_SIZE;
+    const int numStreams = 4;
 
-            // --- Fast, Branchless Reduction (Modulo GF_POLY for GF(2^12)) ---
-            // This logic is specific to the primitive polynomial x^12 + x^3 + 1
-            uint32_t t = tmp & 0x7FC000;
-            tmp ^= t >> 9;
-            tmp ^= t >> 12;
-            t    = tmp & 0x3000;
-            tmp ^= t >> 9;
-            tmp ^= t >> 12;
-            val = (gf)(tmp & GFMASK);
-            // --- End of Multiplication ---
+    // Shared kernel inputs (reused per stream)
+    cudaStream_t streams[numStreams];
+    unsigned char *d_ct[numStreams];
+    gf           *d_syn[numStreams], *d_loc[numStreams];
+    unsigned char *d_err[numStreams], *h_err_batch[numStreams];
 
-            // Complete the Horner's method step, reading the next coefficient from shared memory.
-            val ^= s_sigma[j];
+    for (int i = 0; i < numStreams; ++i) {
+        CUDA_CHECK(cudaStreamCreate(&streams[i]));
+
+        CUDA_CHECK(cudaMalloc(&d_ct[i],   batchSize * crypto_kem_CIPHERTEXTBYTES));
+        CUDA_CHECK(cudaMalloc(&d_syn[i],  batchSize * 2 * SYS_T * sizeof(gf)));
+        CUDA_CHECK(cudaMalloc(&d_loc[i],  batchSize * (SYS_T + 1) * sizeof(gf)));
+        CUDA_CHECK(cudaMalloc(&d_err[i],  batchSize * SYS_N * sizeof(unsigned char)));
+        CUDA_CHECK(cudaMallocHost(&h_err_batch[i], batchSize * SYS_N * sizeof(unsigned char)));
+    }
+
+    float totalH2Dms = 0.0f;
+    float totalD2Hms = 0.0f;
+    float totalKernelMs = 0.0f;
+    float totalBatchMs = 0.0f;
+
+    int batchCount = (total + batchSize - 1) / batchSize;
+
+    for (int b = 0; b < batchCount; ++b) {
+        int streamId    = b % numStreams;
+        cudaStream_t s  = streams[streamId];
+        int offset      = b * batchSize;
+        int actualBatch = (offset + batchSize > total) ? (total - offset) : batchSize;
+
+        // Events
+        cudaEvent_t evH2DStart, evH2DStop;
+        cudaEvent_t evKernelStart, evKernelStop;
+        cudaEvent_t evD2HStart, evD2HStop;
+        cudaEvent_t evBatchStart, evBatchStop;
+
+        cudaEventCreate(&evH2DStart);     cudaEventCreate(&evH2DStop);
+        cudaEventCreate(&evKernelStart);  cudaEventCreate(&evKernelStop);
+        cudaEventCreate(&evD2HStart);     cudaEventCreate(&evD2HStop);
+        cudaEventCreate(&evBatchStart);   cudaEventCreate(&evBatchStop);
+
+        // (1) Start total batch timer
+        cudaEventRecord(evBatchStart, s);
+
+        // (2) H2D transfer
+        cudaEventRecord(evH2DStart, s);
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_ct[streamId],
+            &ciphertexts[offset],
+            actualBatch * crypto_kem_CIPHERTEXTBYTES,
+            cudaMemcpyHostToDevice,
+            s
+        ));
+        cudaEventRecord(evH2DStop, s);
+
+        // (3) Kernel launch
+        cudaEventRecord(evKernelStart, s);
+
+        computeSyndromesKernel<<<
+            dim3(1, actualBatch), 256, sb * sizeof(gf), s
+        >>>((C4*)d_ct[streamId], d_inverse_elements, d_syn[streamId]);
+        CUDA_CHECK(cudaGetLastError());
+
+        berlekampMasseyKernel<<<
+            dim3(1, actualBatch),
+            ((SYS_T + 1 + 31) & ~31),
+            0, s
+        >>>(d_syn[streamId], d_loc[streamId]);
+        CUDA_CHECK(cudaGetLastError());
+
+        chien_search_kernel<<<
+            dim3((SYS_N + 255) / 256, actualBatch),
+            256,
+            (SYS_T + 1) * sizeof(gf),
+            s
+        >>>(d_loc[streamId], d_err[streamId]);
+        CUDA_CHECK(cudaGetLastError());
+
+        cudaEventRecord(evKernelStop, s);
+
+        // (4) D2H copy
+        cudaEventRecord(evD2HStart, s);
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_err_batch[streamId],
+            d_err[streamId],
+            actualBatch * SYS_N * sizeof(unsigned char),
+            cudaMemcpyDeviceToHost,
+            s
+        ));
+        cudaEventRecord(evD2HStop, s);
+
+        // (5) End batch
+        cudaEventRecord(evBatchStop, s);
+
+        // (6) Launch async write-to-disk on host after sync
+        cudaStreamSynchronize(s);  // required before accessing h_err_batch
+
+        // Measure times
+        float h2dMs = 0, d2hMs = 0, kernelMs = 0, batchMs = 0;
+        cudaEventElapsedTime(&h2dMs,     evH2DStart,    evH2DStop);
+        cudaEventElapsedTime(&kernelMs,  evKernelStart, evKernelStop);
+        cudaEventElapsedTime(&d2hMs,     evD2HStart,    evD2HStop);
+        cudaEventElapsedTime(&batchMs,   evBatchStart,  evBatchStop);
+
+        totalH2Dms     += h2dMs;
+        totalD2Hms     += d2hMs;
+        totalKernelMs  += kernelMs;
+        totalBatchMs   += batchMs;
+
+        float throughput = actualBatch * 1000.f / batchMs;
+        printf("[Batch %2d] Total: %.2f ms | H2D: %.2f ms | Kernel: %.2f ms | D2H: %.2f ms → %.2f cw/s\n",
+               b, batchMs, h2dMs, kernelMs, d2hMs, throughput);
+
+        // Write output to file
+        char filename[128];
+        snprintf(filename, sizeof(filename), "Output/errorstream%d.bin", b);
+        FILE *fout = fopen(filename, "wb");
+        if (!fout) {
+            perror("Error writing batch result");
+            exit(EXIT_FAILURE);
         }
+        fwrite(h_err_batch[streamId], sizeof(unsigned char), actualBatch * SYS_N, fout);
+        fclose(fout);
 
-        // If val is 0, alpha^posIdx is a root, meaning an error exists at this position.
-        // The write to global memory is inside the bounds check.
-        d_error_all[cipherIdx * SYS_N + posIdx] = (val == 0);
-    }
-}
-////////////////////////////////////////////////////////////////////////////////
-//  Host pipeline
-////////////////////////////////////////////////////////////////////////////////
-static void decrypt_mass_separate(void)
-{
-    const int SYNS  = 2 * SYS_T;
-    const int LOCS  = SYS_T + 1;
-    const int words = (SYND_BYTES + 3) / 4;
-
-    const size_t packedCtBytes = size_t(KATNUM) * words * sizeof(C4);
-    const size_t synBytes      = size_t(KATNUM) * SYNS * sizeof(gf);
-    const size_t locBytes      = size_t(KATNUM) * LOCS * sizeof(gf);
-    const size_t errBytes      = size_t(KATNUM) * SYS_N * sizeof(unsigned char);
-
-    C4 *h_ct4 = (C4 *)malloc(packedCtBytes);
-    memset(h_ct4, 0, packedCtBytes);
-
-    for (int ct = 0; ct < KATNUM; ++ct) {
-        const unsigned char *src = &ciphertexts[ct][0];
-        memcpy(reinterpret_cast<unsigned char *>(h_ct4) + ct * words * 4,
-               src, crypto_kem_CIPHERTEXTBYTES);
+        // Cleanup events for this batch
+        cudaEventDestroy(evH2DStart);     cudaEventDestroy(evH2DStop);
+        cudaEventDestroy(evKernelStart);  cudaEventDestroy(evKernelStop);
+        cudaEventDestroy(evD2HStart);     cudaEventDestroy(evD2HStop);
+        cudaEventDestroy(evBatchStart);   cudaEventDestroy(evBatchStop);
     }
 
-    gf *h_syn = (gf *)malloc(synBytes);
-    gf *h_loc = (gf *)malloc(locBytes);
-    unsigned char *h_err = (unsigned char *)malloc(errBytes);
+    // Final cleanup
+    for (int i = 0; i < numStreams; ++i) {
+        CUDA_CHECK(cudaFree(d_ct[i]));
+        CUDA_CHECK(cudaFree(d_syn[i]));
+        CUDA_CHECK(cudaFree(d_loc[i]));
+        CUDA_CHECK(cudaFree(d_err[i]));
+        CUDA_CHECK(cudaFreeHost(h_err_batch[i]));
+        CUDA_CHECK(cudaStreamDestroy(streams[i]));
+    }
 
-    C4 *d_ct4   = nullptr; CHECK_CUDA(cudaMalloc(&d_ct4, packedCtBytes));
-    gf *d_syn   = nullptr; CHECK_CUDA(cudaMalloc(&d_syn, synBytes));
-    gf *d_loc   = nullptr; CHECK_CUDA(cudaMalloc(&d_loc, locBytes));
-    unsigned char *d_err = nullptr; CHECK_CUDA(cudaMalloc(&d_err, errBytes));
+    cudaDeviceReset();
 
-    CHECK_CUDA(cudaMemcpy(d_ct4, h_ct4, packedCtBytes, cudaMemcpyHostToDevice));
-
-    dim3 gridSyn(1, KATNUM);
-    const int threadsSyn = 256;
-    const int shSyn      = (sb + 2 * SYS_T) * sizeof(gf);
-    computeSyndromesKernel<<<gridSyn, threadsSyn, shSyn>>>(d_ct4, d_inverse_elements, d_syn);
-    CHECK_CUDA(cudaGetLastError());
-
-    const int threadsBM = ((SYS_T + 1 + 31) & ~31);
-    berlekampMasseyKernel<<< dim3(1, KATNUM), threadsBM >>>(d_syn, d_loc);
-    CHECK_CUDA(cudaGetLastError());
-
-    const int threadsCS = 256;
-    const int blocksCS  = (SYS_N + threadsCS - 1) / threadsCS;
-    dim3 gridCS(blocksCS, KATNUM);
-    chien_search_kernel<<<gridCS, threadsCS>>>(d_loc, d_err);
-    CHECK_CUDA(cudaGetLastError());
-
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemcpy(h_err, d_err, errBytes, cudaMemcpyDeviceToHost));
-
-    // for (int ct = 0; ct < KATNUM; ++ct) {
-    //     for (int i = 0; i < SYS_N; ++i) if (h_err[ct * SYS_N + i]) printf("%d ", i);
-    //     printf("\n");
-    // }
-
-    free(h_ct4); free(h_syn); free(h_loc); free(h_err);
-    CHECK_CUDA(cudaFree(d_ct4));
-    CHECK_CUDA(cudaFree(d_syn));
-    CHECK_CUDA(cudaFree(d_loc));
-    CHECK_CUDA(cudaFree(d_err));
-    CHECK_CUDA(cudaDeviceReset());
+    // Print final summary
+    printf("\n===== Summary =====\n");
+    printf("Total Host→Device (H2D) transfer time : %.2f ms\n", totalH2Dms);
+    printf("Total Device→Host (D2H) transfer time : %.2f ms\n", totalD2Hms);
+    printf("Total Kernel execution time           : %.2f ms\n", totalKernelMs);
+    printf("Total End-to-End batch time           : %.2f ms\n", totalBatchMs);
 }
 
-////////////////////////////////////////////////////////////////////////////////
-//  main – build field tables, then call pipeline
-////////////////////////////////////////////////////////////////////////////////
 int main(void)
-{
+{ 
+    //   unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES] =  malloc(KATNUM * sizeof(*ciphertexts));
+    cudaDeviceReset();
     initialisation(secretkeys, ciphertexts, sk, L, g);
     compute_inverses();
     InitializeC();
-    decrypt_mass_separate();
+    // decrypt_mass_pipelined(unsigned char (*ciphertexts)[crypto_kem_CIPHERTEXTBYTES]);
+    // decrypt_mass_pipelined(ciphertexts);
+    decrypt_mass_streamed_to_disk(ciphertexts);
+    cudaDeviceReset();
     return 0;
 }
+// -----------------------------------------------------------------------------

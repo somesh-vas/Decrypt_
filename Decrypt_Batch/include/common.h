@@ -13,7 +13,8 @@
 #define KAT_FILE_OPEN_ERROR  -1
 #define KAT_CRYPTO_FAILURE   -4
 
-#define KATNUM                         50000     /* test-vectors to run      */
+#define KATNUM                          50000  /* test-vectors to run      */
+#define BATCH_SIZE  50000
 #define CIPHERT                        20    /* (left as-is from legacy) */
 
 #define crypto_kem_SECRETKEYBYTES   6492
